@@ -1,0 +1,409 @@
+name: "Cloudflare Pages: attach custom domain + redirect pages.dev"
+
+on:
+  workflow_call:
+    secrets:
+      CLOUDFLARE_API_TOKEN:
+        required: true
+      CLOUDFLARE_ACCOUNT_ID:
+        required: true
+      CLOUDFLARE_ZONE_ID:
+        required: true
+
+      # Pages project info (project must already exist; you create it manually)
+      PAGES_PROJECT_NAME:
+        required: true
+
+      # The default Pages hostname you want to “disable” via redirect (no scheme)
+      # Example: masage-website.pages.dev
+      PAGES_DEV_HOSTNAME:
+        required: true
+
+      # The custom domain you want to use (full hostname)
+      # Example: centrodebienestar.negociosprivadoscr.com
+      CUSTOM_DOMAIN:
+        required: true
+
+      # Optional overrides (leave unset to auto-generate safe names)
+      BULK_REDIRECT_LIST_NAME:
+        required: false
+      BULK_REDIRECT_RULE_REF:
+        required: false
+      BULK_REDIRECT_RULESET_NAME:
+        required: false
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Install jq
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+
+      - name: Configure Cloudflare (DNS + Pages domain + Bulk Redirect)
+        shell: bash
+        env:
+          CF_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CF_ZONE_ID: ${{ secrets.CLOUDFLARE_ZONE_ID }}
+
+          PAGES_PROJECT: ${{ secrets.PAGES_PROJECT_NAME }}
+          PAGES_DEV_HOST: ${{ secrets.PAGES_DEV_HOSTNAME }}
+          CUSTOM_DOMAIN: ${{ secrets.CUSTOM_DOMAIN }}
+
+          OVERRIDE_LIST_NAME: ${{ secrets.BULK_REDIRECT_LIST_NAME }}
+          OVERRIDE_RULE_REF: ${{ secrets.BULK_REDIRECT_RULE_REF }}
+          OVERRIDE_RULESET_NAME: ${{ secrets.BULK_REDIRECT_RULESET_NAME }}
+        run: |
+          set -euo pipefail
+
+          SUMMARY_OK=()
+          SUMMARY_WARN=()
+
+          start_group() { echo "::group::$1"; }
+          end_group() { echo "::endgroup::"; }
+          ok() { echo "✔ $1"; SUMMARY_OK+=("$1"); }
+          warn() { echo "! $1"; SUMMARY_WARN+=("$1"); }
+
+          cf() {
+            local method="$1"
+            local path="$2"
+            local data="${3:-}"
+            local url="https://api.cloudflare.com/client/v4${path}"
+
+            if [[ -n "$data" ]]; then
+              curl -sS --request "$method" "$url" \
+                --header "Authorization: Bearer ${CF_API_TOKEN}" \
+                --header "Content-Type: application/json" \
+                --data "$data"
+            else
+              curl -sS --request "$method" "$url" \
+                --header "Authorization: Bearer ${CF_API_TOKEN}" \
+                --header "Content-Type: application/json"
+            fi
+          }
+
+          die() { echo "::error::$1"; exit 1; }
+
+          start_group "0) Validate inputs"
+          [[ -n "${CF_API_TOKEN:-}" ]] || die "Missing CF_API_TOKEN"
+          [[ -n "${CF_ACCOUNT_ID:-}" ]] || die "Missing CF_ACCOUNT_ID"
+          [[ -n "${CF_ZONE_ID:-}" ]] || die "Missing CF_ZONE_ID"
+          [[ -n "${PAGES_PROJECT:-}" ]] || die "Missing PAGES_PROJECT"
+          [[ -n "${PAGES_DEV_HOST:-}" ]] || die "Missing PAGES_DEV_HOST"
+          [[ -n "${CUSTOM_DOMAIN:-}" ]] || die "Missing CUSTOM_DOMAIN"
+          ok "Inputs present"
+          end_group
+
+          # -------------------------
+          # Derive names safely
+          # -------------------------
+          start_group "Derive names"
+          PAGES_DEV_URL="https://${PAGES_DEV_HOST}"
+          TARGET_URL="https://${CUSTOM_DOMAIN}"
+
+          # Cloudflare "list variables" work best with [A-Za-z0-9_]
+          # If user didn't provide a list name, generate one from project + domain
+          RAW_LIST_NAME="${OVERRIDE_LIST_NAME:-pagesdev_to_${CUSTOM_DOMAIN}}"
+          LIST_NAME="$(echo "$RAW_LIST_NAME" | sed 's/[^A-Za-z0-9_]/_/g')"
+
+          RULE_REF="${OVERRIDE_RULE_REF:-redirect_pagesdev_to_custom_${LIST_NAME}}"
+          RULESET_NAME="${OVERRIDE_RULESET_NAME:-Bulk Redirects (managed by GitHub Actions)}"
+
+          echo "Using:"
+          echo "  PAGES_PROJECT=${PAGES_PROJECT}"
+          echo "  CUSTOM_DOMAIN=${CUSTOM_DOMAIN}"
+          echo "  PAGES_DEV_HOST=${PAGES_DEV_HOST}"
+          echo "  LIST_NAME=${LIST_NAME}"
+          echo "  RULE_REF=${RULE_REF}"
+          ok "Names derived"
+          end_group
+
+          # -------------------------
+          # 1) Ensure DNS CNAME exists (proxied)
+          #    CUSTOM_DOMAIN -> PAGES_DEV_HOST
+          # -------------------------
+          start_group "1) DNS: ensure proxied CNAME"
+          echo "Ensuring DNS CNAME exists (proxied)..."
+          dns_search="$(cf GET "/zones/${CF_ZONE_ID}/dns_records?type=CNAME&name=${CUSTOM_DOMAIN}")"
+          echo "$dns_search" | jq -e '.success == true' >/dev/null || die "DNS search failed: $(echo "$dns_search" | jq -c '.errors')"
+
+          record_id="$(echo "$dns_search" | jq -r '.result[0].id // empty')"
+
+          dns_payload="$(jq -n \
+            --arg type "CNAME" \
+            --arg name "${CUSTOM_DOMAIN}" \
+            --arg content "${PAGES_DEV_HOST}" \
+            --argjson ttl 1 \
+            --argjson proxied true \
+            '{type:$type,name:$name,content:$content,ttl:$ttl,proxied:$proxied}'
+          )"
+
+          if [[ -n "$record_id" ]]; then
+            echo "Updating existing CNAME record id=${record_id}"
+            dns_upd="$(cf PUT "/zones/${CF_ZONE_ID}/dns_records/${record_id}" "$dns_payload")"
+            echo "$dns_upd" | jq -e '.success == true' >/dev/null || die "DNS update failed: $(echo "$dns_upd" | jq -c '.errors')"
+            dns_result="$dns_upd"
+          else
+            echo "Creating new CNAME record"
+            dns_new="$(cf POST "/zones/${CF_ZONE_ID}/dns_records" "$dns_payload")"
+            echo "$dns_new" | jq -e '.success == true' >/dev/null || die "DNS create failed: $(echo "$dns_new" | jq -c '.errors')"
+            dns_result="$dns_new"
+          fi
+
+          # Verify record content + proxy setting
+          actual_content="$(echo "$dns_result" | jq -r '.result.content // empty')"
+          actual_proxied="$(echo "$dns_result" | jq -r '.result.proxied // empty')"
+          [[ "$actual_content" == "${PAGES_DEV_HOST}" ]] || die "DNS CNAME content mismatch: expected=${PAGES_DEV_HOST}, got=${actual_content}"
+          [[ "$actual_proxied" == "true" ]] || die "DNS record is not proxied (proxied must be true)."
+          ok "DNS CNAME ensured"
+          end_group
+
+          # -------------------------
+          # 2) Add CUSTOM_DOMAIN to the Pages project (if missing)
+          # -------------------------
+          start_group "2) Pages: attach custom domain"
+          echo "Ensuring Pages project has CUSTOM_DOMAIN..."
+          domain_get="$(cf GET "/accounts/${CF_ACCOUNT_ID}/pages/projects/${PAGES_PROJECT}/domains/${CUSTOM_DOMAIN}")"
+
+          if echo "$domain_get" | jq -e '.success == true' >/dev/null; then
+            echo "Pages domain already exists on project."
+          else
+            echo "Adding domain to Pages project..."
+            add_payload="$(jq -n --arg name "${CUSTOM_DOMAIN}" '{name:$name}')"
+            domain_add="$(cf POST "/accounts/${CF_ACCOUNT_ID}/pages/projects/${PAGES_PROJECT}/domains" "$add_payload")"
+            echo "$domain_add" | jq -e '.success == true' >/dev/null || die "Pages add domain failed: $(echo "$domain_add" | jq -c '.errors')"
+          fi
+
+          # Verify it exists now; status may be pending/active depending on TLS issuance.
+          domain_get2="$(cf GET "/accounts/${CF_ACCOUNT_ID}/pages/projects/${PAGES_PROJECT}/domains/${CUSTOM_DOMAIN}")"
+          echo "$domain_get2" | jq -e '.success == true' >/dev/null || die "Pages domain still not readable after attach: $(echo "$domain_get2" | jq -c '.errors')"
+          domain_status="$(echo "$domain_get2" | jq -r '.result.status // "unknown"')"
+          echo "Pages domain status: ${domain_status}"
+          if [[ "$domain_status" == "failed" || "$domain_status" == "error" ]]; then
+            die "Pages domain status indicates failure: ${domain_status}"
+          fi
+          ok "Pages custom domain attached (status=${domain_status})"
+
+          # Optional: trigger a validation retry (safe/no-op if already active)
+          echo "Retrying domain validation (optional)..."
+          domain_retry="$(cf PATCH "/accounts/${CF_ACCOUNT_ID}/pages/projects/${PAGES_PROJECT}/domains/${CUSTOM_DOMAIN}" '{}')"
+          if echo "$domain_retry" | jq -e '.success == true' >/dev/null; then
+            ok "Pages validation retry requested"
+          else
+            warn "Pages validation retry not applied (non-fatal)"
+          fi
+          end_group
+
+          # -------------------------
+          # 3) Ensure Bulk Redirect list exists (kind=redirect)
+          # -------------------------
+          start_group "3) Bulk Redirects: ensure list"
+          echo "Ensuring Bulk Redirect list exists..."
+          lists="$(cf GET "/accounts/${CF_ACCOUNT_ID}/rules/lists?per_page=100")"
+          echo "$lists" | jq -e '.success == true' >/dev/null || die "List fetch failed: $(echo "$lists" | jq -c '.errors')"
+
+          list_id="$(echo "$lists" | jq -r --arg n "${LIST_NAME}" '.result[] | select(.name==$n and .kind=="redirect") | .id' | head -n 1)"
+
+          if [[ -z "$list_id" ]]; then
+            echo "Creating list ${LIST_NAME}..."
+            list_payload="$(jq -n \
+              --arg name "${LIST_NAME}" \
+              --arg kind "redirect" \
+              --arg description "Redirect ${PAGES_DEV_HOST} -> ${CUSTOM_DOMAIN} (managed by GitHub Actions)" \
+              '{name:$name,kind:$kind,description:$description}'
+            )"
+            list_create="$(cf POST "/accounts/${CF_ACCOUNT_ID}/rules/lists" "$list_payload")"
+            echo "$list_create" | jq -e '.success == true' >/dev/null || die "List create failed: $(echo "$list_create" | jq -c '.errors')"
+            list_id="$(echo "$list_create" | jq -r '.result.id')"
+          else
+            echo "List already exists: id=${list_id}"
+          fi
+
+          [[ -n "$list_id" ]] || die "Bulk Redirect list_id is empty"
+          ok "Bulk Redirect list ensured (id=${list_id})"
+          end_group
+
+          # -------------------------
+          # 4) Upsert list item: redirect pages.dev -> custom domain
+          #    (async bulk operation, we poll until completed)
+          # -------------------------
+          start_group "4) Bulk Redirects: add list item"
+          echo "Adding/updating redirect item in list..."
+          items_payload="$(jq -n \
+            --arg source "${PAGES_DEV_URL}/*" \
+            --arg target "${TARGET_URL}" \
+            '[{
+              redirect: {
+                source_url: $source,
+                target_url: $target,
+                status_code: 301,
+                include_subdomains: true,
+                subpath_matching: true,
+                preserve_query_string: true,
+                preserve_path_suffix: true
+              }
+            }]'
+          )"
+
+          items_resp="$(cf POST "/accounts/${CF_ACCOUNT_ID}/rules/lists/${list_id}/items" "$items_payload")"
+          echo "$items_resp" | jq -e '.success == true' >/dev/null || die "Add list items failed: $(echo "$items_resp" | jq -c '.errors')"
+
+          op_id="$(echo "$items_resp" | jq -r '.result.operation_id // empty')"
+          [[ -n "$op_id" ]] || die "No operation_id returned for list item update."
+
+          echo "Waiting for list operation to complete: ${op_id}"
+          for i in {1..30}; do
+            op="$(cf GET "/accounts/${CF_ACCOUNT_ID}/rules/lists/bulk_operations/${op_id}")"
+            echo "$op" | jq -e '.success == true' >/dev/null || die "Bulk op status failed: $(echo "$op" | jq -c '.errors')"
+            status="$(echo "$op" | jq -r '.result.status')"
+            echo "  status=${status}"
+            if [[ "$status" == "completed" ]]; then
+              break
+            fi
+            if [[ "$status" == "failed" ]]; then
+              die "Bulk operation failed: $(echo "$op" | jq -c '.result')"
+            fi
+            sleep 2
+          done
+
+          # Confirm completion
+          final_status="$(echo "$op" | jq -r '.result.status // empty')"
+          [[ "$final_status" == "completed" ]] || die "Bulk Redirect list item operation did not complete (status=${final_status})"
+          ok "Bulk Redirect list item applied"
+          end_group
+
+          # -------------------------
+          # 5) Ensure Bulk Redirect rule exists in account entrypoint ruleset
+          #    phase: http_request_redirect
+          # -------------------------
+          start_group "5) Rulesets: ensure redirect rule"
+          echo "Ensuring Bulk Redirect rule exists in http_request_redirect entrypoint..."
+
+          entry="$(cf GET "/accounts/${CF_ACCOUNT_ID}/rulesets/phases/http_request_redirect/entrypoint")"
+
+          list_var="\$${LIST_NAME}"
+          expr="http.request.full_uri in ${list_var}"
+
+          new_rule="$(jq -n \
+            --arg action "redirect" \
+            --arg expression "${expr}" \
+            --arg description "Redirect ${PAGES_DEV_HOST} to ${CUSTOM_DOMAIN}" \
+            --arg ref "${RULE_REF}" \
+            --arg list_name "${list_var}" \
+            '{
+              action: $action,
+              expression: $expression,
+              description: $description,
+              enabled: true,
+              ref: $ref,
+              action_parameters: {
+                from_list: {
+                  name: $list_name,
+                  key: "http.request.full_uri"
+                }
+              }
+            }'
+          )"
+
+          if echo "$entry" | jq -e '.success == true' >/dev/null; then
+            ruleset_name="$(echo "$entry" | jq -r '.result.name // empty')"
+            ruleset_desc="$(echo "$entry" | jq -r '.result.description // empty')"
+            rules="$(echo "$entry" | jq -c '.result.rules // []')"
+
+            has_rule="$(echo "$rules" | jq -r --arg ref "${RULE_REF}" 'any(.[]; .ref == $ref)')"
+
+            if [[ "$has_rule" == "true" ]]; then
+              echo "Rule already present (ref=${RULE_REF})."
+            else
+              echo "Appending rule (ref=${RULE_REF})..."
+              updated_rules="$(echo "$rules" | jq --argjson r "$new_rule" '. + [$r]')"
+              upd_payload="$(jq -n \
+                --arg name "${ruleset_name:-$RULESET_NAME}" \
+                --arg description "${ruleset_desc:-$RULESET_NAME}" \
+                --argjson rules "$updated_rules" \
+                '{name:$name, description:$description, rules:$rules}'
+              )"
+              upd="$(cf PUT "/accounts/${CF_ACCOUNT_ID}/rulesets/phases/http_request_redirect/entrypoint" "$upd_payload")"
+              echo "$upd" | jq -e '.success == true' >/dev/null || die "Ruleset entrypoint update failed: $(echo "$upd" | jq -c '.errors')"
+            fi
+          else
+            echo "No entrypoint ruleset yet. Creating one at the entrypoint..."
+            create_payload="$(jq -n \
+              --arg name "${RULESET_NAME}" \
+              --arg description "${RULESET_NAME}" \
+              --argjson rules "$(jq -n --argjson r "$new_rule" '[ $r ]')" \
+              '{name:$name, description:$description, rules:$rules}'
+            )"
+            created="$(cf PUT "/accounts/${CF_ACCOUNT_ID}/rulesets/phases/http_request_redirect/entrypoint" "$create_payload")"
+            echo "$created" | jq -e '.success == true' >/dev/null || die "Ruleset entrypoint create failed: $(echo "$created" | jq -c '.errors')"
+          fi
+
+          # Verify rule exists now
+          entry2="$(cf GET "/accounts/${CF_ACCOUNT_ID}/rulesets/phases/http_request_redirect/entrypoint")"
+          echo "$entry2" | jq -e '.success == true' >/dev/null || die "Ruleset entrypoint not readable after update/create: $(echo "$entry2" | jq -c '.errors')"
+          has_rule2="$(echo "$entry2" | jq -r --arg ref "${RULE_REF}" 'any(.result.rules[]?; .ref == $ref)')"
+          [[ "$has_rule2" == "true" ]] || die "Redirect rule not present after update/create (ref=${RULE_REF})"
+          ok "Redirect rule ensured in entrypoint"
+          end_group
+
+          # -------------------------
+          # 6) HTTP post-check: confirm pages.dev redirects to custom domain
+          # -------------------------
+          start_group "6) Post-check: HTTP redirect"
+
+          test_path="/__gha_pagesdev_redirect_check"
+          test_url_pagesdev="${PAGES_DEV_URL}${test_path}?t=$(date +%s)"
+          test_url_custom="${TARGET_URL}${test_path}?t=$(date +%s)"
+
+          echo "Checking redirect: ${test_url_pagesdev} -> ${TARGET_URL}"
+
+          redirect_ok="false"
+          for i in {1..15}; do
+            echo "Attempt ${i}/15..."
+            headers="$(curl -sS -o /dev/null -D - -I --max-time 15 "$test_url_pagesdev" || true)"
+            status_line="$(echo "$headers" | head -n 1 | tr -d '\r')"
+            location="$(echo "$headers" | awk 'BEGIN{IGNORECASE=1} /^Location:/{sub(/^Location:[[:space:]]*/,"",$0); gsub(/\r/,"",$0); print; exit}')"
+
+            echo "  ${status_line}"
+            echo "  Location: ${location:-<none>}"
+
+            # Accept 301/302/307/308 with Location starting with custom domain
+            if echo "$status_line" | grep -Eq 'HTTP/[0-9.]+[[:space:]]+(301|302|307|308)'; then
+              if [[ -n "$location" ]] && echo "$location" | grep -Fq "${TARGET_URL}"; then
+                redirect_ok="true"
+                break
+              fi
+            fi
+            sleep 3
+          done
+
+          [[ "$redirect_ok" == "true" ]] || die "pages.dev did not redirect to ${TARGET_URL} after retries."
+          ok "pages.dev redirects to custom domain"
+
+          echo "Checking custom domain responds (not a 5xx)..."
+          headers2="$(curl -sS -o /dev/null -D - -I --max-time 15 "$test_url_custom" || true)"
+          status_line2="$(echo "$headers2" | head -n 1 | tr -d '\r')"
+          echo "  ${status_line2}"
+          if echo "$status_line2" | grep -Eq 'HTTP/[0-9.]+[[:space:]]+5'; then
+            die "Custom domain returned a 5xx during check: ${status_line2}"
+          fi
+          ok "custom domain is serving HTTP"
+
+          end_group
+
+          # -------------------------
+          # Final summary
+          # -------------------------
+          echo ""
+          echo "===== Final summary ====="
+          for s in "${SUMMARY_OK[@]}"; do
+            echo "✔ ${s}"
+          done
+          for s in "${SUMMARY_WARN[@]}"; do
+            echo "! ${s}"
+          done
+
+          echo "Done. Your pages.dev hostname should now redirect to the custom domain."

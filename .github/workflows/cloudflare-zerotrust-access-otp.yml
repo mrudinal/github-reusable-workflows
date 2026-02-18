@@ -1,0 +1,458 @@
+name: Reusable - Cloudflare Zero Trust Access (One-time PIN gate)
+
+on:
+  workflow_call:
+    secrets:
+      CF_API_TOKEN:
+        required: true
+      CF_ACCOUNT_ID:
+        required: true
+
+      # Access app settings (you asked to pass everything as secrets)
+      CF_ACCESS_APP_NAME:
+        required: true
+      CF_ACCESS_DOMAIN:
+        required: true  # e.g. negociosprivadoscr.com
+      CF_ACCESS_SUBDOMAIN:
+        required: true  # e.g. centrodebienestar   (use @ for apex)
+      CF_ACCESS_PATH:
+        required: false # e.g. / (empty means whole hostname)
+      CF_ACCESS_SESSION_DURATION:
+        required: true  # e.g. 24h
+
+      # Policy settings
+      CF_ACCESS_POLICY_NAME:
+        required: true  # e.g. Allowed_emails
+      CF_ALLOWED_EMAILS:
+        required: true  # comma-separated: a@b.com,c@d.com
+
+jobs:
+  configure-access:
+    runs-on: ubuntu-latest
+    env:
+      CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+      CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+
+      CF_ACCESS_APP_NAME: ${{ secrets.CF_ACCESS_APP_NAME }}
+      CF_ACCESS_DOMAIN: ${{ secrets.CF_ACCESS_DOMAIN }}
+      CF_ACCESS_SUBDOMAIN: ${{ secrets.CF_ACCESS_SUBDOMAIN }}
+      CF_ACCESS_PATH: ${{ secrets.CF_ACCESS_PATH }}
+      CF_ACCESS_SESSION_DURATION: ${{ secrets.CF_ACCESS_SESSION_DURATION }}
+
+      CF_ACCESS_POLICY_NAME: ${{ secrets.CF_ACCESS_POLICY_NAME }}
+      CF_ALLOWED_EMAILS: ${{ secrets.CF_ALLOWED_EMAILS }}
+    steps:
+      - name: ✅ Preflight - tools + inputs
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          echo "🔎 Preflight checks..."
+
+          required_vars=(
+            CF_API_TOKEN
+            CF_ACCOUNT_ID
+            CF_ACCESS_APP_NAME
+            CF_ACCESS_DOMAIN
+            CF_ACCESS_SUBDOMAIN
+            CF_ACCESS_SESSION_DURATION
+            CF_ACCESS_POLICY_NAME
+            CF_ALLOWED_EMAILS
+          )
+
+          for v in "${required_vars[@]}"; do
+            if [ -z "${!v:-}" ]; then
+              echo "❌ Missing required secret/env: $v"
+              exit 1
+            fi
+          done
+
+          if ! command -v jq >/dev/null 2>&1; then
+            echo "Installing jq..."
+            sudo apt-get update -y
+            sudo apt-get install -y jq
+          fi
+
+          echo "✅ Preflight OK"
+
+      - name: ✅ Verify Cloudflare API token
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          echo "🔐 Verifying API token..."
+
+          resp="$(curl -sS -X GET \
+            "https://api.cloudflare.com/client/v4/user/tokens/verify" \
+            -H "Authorization: Bearer $CF_API_TOKEN" \
+            -H "Content-Type: application/json")"
+
+          echo "$resp" | jq -e '.success == true' >/dev/null
+          status="$(echo "$resp" | jq -r '.result.status // empty')"
+          if [ "$status" != "active" ]; then
+            echo "❌ Token is not active. Status: $status"
+            exit 1
+          fi
+
+          echo "✅ Token verified (active)"
+
+      - name: ✅ Build target hostname
+        id: host
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          domain="$CF_ACCESS_DOMAIN"
+          sub="$CF_ACCESS_SUBDOMAIN"
+          path="${CF_ACCESS_PATH:-}"
+
+          if [ "$sub" = "@" ]; then
+            host="$domain"
+          else
+            host="$sub.$domain"
+          fi
+
+          # Normalize path (optional)
+          if [ -n "${path:-}" ]; then
+            if [[ "$path" != /* ]]; then
+              path="/$path"
+            fi
+            # Remove trailing slash except for "/"
+            if [ "$path" != "/" ]; then
+              path="${path%/}"
+            fi
+            app_domain="${host}${path}"
+          else
+            app_domain="$host"
+          fi
+
+          echo "HOST=$host" >> "$GITHUB_OUTPUT"
+          echo "APP_DOMAIN=$app_domain" >> "$GITHUB_OUTPUT"
+
+          echo "🌐 Host: $host"
+          echo "🌐 Access Application domain field: $app_domain"
+          echo "✅ Hostname assembled"
+
+      - name: ✅ Pre-check - origin responds (before Access changes)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          url="https://${{ steps.host.outputs.HOST }}"
+          echo "🌐 Pre-check request: $url"
+          code="$(curl -sS -o /dev/null -I -L -w "%{http_code}" "$url" || true)"
+          echo "HTTP status observed: $code"
+          # We don't hard-fail here because Access might already be on.
+          echo "✅ Pre-check complete"
+
+      - name: ✅ Ensure One-time PIN IdP exists
+        id: idp
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          acct="$CF_ACCOUNT_ID"
+          token="$CF_API_TOKEN"
+
+          echo "🔎 Checking identity providers..."
+          list="$(curl -sS -X GET \
+            "https://api.cloudflare.com/client/v4/accounts/$acct/access/identity_providers" \
+            -H "Authorization: Bearer $token" \
+            -H "Content-Type: application/json")"
+
+          echo "$list" | jq -e '.success == true' >/dev/null
+
+          otp_id="$(echo "$list" | jq -r '.result[]? | select(.type=="onetimepin") | .id' | head -n 1 || true)"
+
+          if [ -z "${otp_id:-}" ]; then
+            echo "➕ One-time PIN not found. Creating it..."
+            create="$(curl -sS -X POST \
+              "https://api.cloudflare.com/client/v4/accounts/$acct/access/identity_providers" \
+              -H "Authorization: Bearer $token" \
+              -H "Content-Type: application/json" \
+              --data '{"name":"One-time PIN","type":"onetimepin","config":{}}')"
+
+            echo "$create" | jq -e '.success == true' >/dev/null
+            otp_id="$(echo "$create" | jq -r '.result.id')"
+            if [ -z "${otp_id:-}" ] || [ "$otp_id" = "null" ]; then
+              echo "❌ Failed to create One-time PIN IdP."
+              exit 1
+            fi
+            echo "✅ Created One-time PIN IdP: $otp_id"
+          else
+            echo "✅ One-time PIN IdP already exists: $otp_id"
+          fi
+
+          echo "OTP_IDP_ID=$otp_id" >> "$GITHUB_OUTPUT"
+
+      - name: ✅ Ensure Access application exists (create or update)
+        id: app
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          acct="$CF_ACCOUNT_ID"
+          token="$CF_API_TOKEN"
+          app_name="$CF_ACCESS_APP_NAME"
+          app_domain="${{ steps.host.outputs.APP_DOMAIN }}"
+          session="$CF_ACCESS_SESSION_DURATION"
+          otp_id="${{ steps.idp.outputs.OTP_IDP_ID }}"
+
+          echo "🔎 Listing Access applications..."
+          apps="$(curl -sS -X GET \
+            "https://api.cloudflare.com/client/v4/accounts/$acct/access/apps" \
+            -H "Authorization: Bearer $token" \
+            -H "Content-Type: application/json")"
+          echo "$apps" | jq -e '.success == true' >/dev/null
+
+          # Try to match by domain first, then by name
+          app_id="$(echo "$apps" | jq -r --arg d "$app_domain" --arg n "$app_name" '
+            .result[]?
+            | select((.domain? == $d) or (.name? == $n))
+            | .id
+          ' | head -n 1 || true)"
+
+          if [ -z "${app_id:-}" ]; then
+            echo "➕ Creating Access application..."
+            payload="$(jq -n \
+              --arg name "$app_name" \
+              --arg type "self_hosted" \
+              --arg domain "$app_domain" \
+              --arg session "$session" \
+              --argjson allowed_idps "$(jq -n --arg id "$otp_id" '[ $id ]')" \
+              '{
+                name: $name,
+                type: $type,
+                domain: $domain,
+                session_duration: $session,
+                allowed_idps: $allowed_idps,
+                app_launcher_visible: false
+              }'
+            )"
+
+            created="$(curl -sS -X POST \
+              "https://api.cloudflare.com/client/v4/accounts/$acct/access/apps" \
+              -H "Authorization: Bearer $token" \
+              -H "Content-Type: application/json" \
+              --data "$payload")"
+
+            echo "$created" | jq -e '.success == true' >/dev/null
+            app_id="$(echo "$created" | jq -r '.result.id')"
+            if [ -z "${app_id:-}" ] || [ "$app_id" = "null" ]; then
+              echo "❌ Failed to create Access application."
+              exit 1
+            fi
+            echo "✅ Created Access application: $app_id"
+          else
+            echo "♻️ Access application exists: $app_id"
+            echo "🔧 Updating it safely (GET then PUT with full body)..."
+
+            current="$(curl -sS -X GET \
+              "https://api.cloudflare.com/client/v4/accounts/$acct/access/apps/$app_id" \
+              -H "Authorization: Bearer $token" \
+              -H "Content-Type: application/json")"
+            echo "$current" | jq -e '.success == true' >/dev/null
+
+            updated_payload="$(echo "$current" | jq \
+              --arg name "$app_name" \
+              --arg domain "$app_domain" \
+              --arg session "$session" \
+              --arg otp "$otp_id" \
+              '.result
+               | .name=$name
+               | .domain=$domain
+               | .session_duration=$session
+               | .allowed_idps=[ $otp ]
+               | .app_launcher_visible=false
+              ')"
+
+            updated="$(curl -sS -X PUT \
+              "https://api.cloudflare.com/client/v4/accounts/$acct/access/apps/$app_id" \
+              -H "Authorization: Bearer $token" \
+              -H "Content-Type: application/json" \
+              --data "$updated_payload")"
+
+            echo "$updated" | jq -e '.success == true' >/dev/null
+            echo "✅ Updated Access application"
+          fi
+
+          echo "APP_ID=$app_id" >> "$GITHUB_OUTPUT"
+
+      - name: ✅ Ensure Allow policy exists and is reusable
+        id: policy
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          acct="$CF_ACCOUNT_ID"
+          token="$CF_API_TOKEN"
+          app_id="${{ steps.app.outputs.APP_ID }}"
+          pname="$CF_ACCESS_POLICY_NAME"
+          emails_csv="$CF_ALLOWED_EMAILS"
+
+          # Build include rules from CSV
+          emails_json="$(echo "$emails_csv" \
+            | tr ',' '\n' \
+            | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' \
+            | awk 'NF' \
+            | jq -R -s '
+                split("\n")
+                | map(select(length>0))
+                | map({email:{email:.}})
+              ')"
+
+          echo "🔎 Listing policies for app $app_id ..."
+          pols="$(curl -sS -X GET \
+            "https://api.cloudflare.com/client/v4/accounts/$acct/access/apps/$app_id/policies" \
+            -H "Authorization: Bearer $token" \
+            -H "Content-Type: application/json")"
+
+          echo "$pols" | jq -e '.success == true' >/dev/null
+
+          pol_id="$(echo "$pols" | jq -r --arg n "$pname" '
+            .result[]?
+            | select(.name? == $n)
+            | (.id // .uid)
+          ' | head -n 1 || true)"
+
+          if [ -z "${pol_id:-}" ]; then
+            echo "➕ Creating legacy app policy (then converting to reusable)..."
+            create_payload="$(jq -n \
+              --arg name "$pname" \
+              --arg decision "allow" \
+              --argjson include "$emails_json" \
+              '{
+                name: $name,
+                decision: $decision,
+                include: $include,
+                precedence: 1
+              }'
+            )"
+
+            created="$(curl -sS -X POST \
+              "https://api.cloudflare.com/client/v4/accounts/$acct/access/apps/$app_id/policies" \
+              -H "Authorization: Bearer $token" \
+              -H "Content-Type: application/json" \
+              --data "$create_payload")"
+
+            echo "$created" | jq -e '.success == true' >/dev/null
+            pol_id="$(echo "$created" | jq -r '.result.id')"
+            if [ -z "${pol_id:-}" ] || [ "$pol_id" = "null" ]; then
+              echo "❌ Failed to create app policy."
+              exit 1
+            fi
+            echo "✅ Created app policy: $pol_id"
+
+            echo "🔁 Converting policy to reusable..."
+            conv="$(curl -sS -X PUT \
+              "https://api.cloudflare.com/client/v4/accounts/$acct/access/apps/$app_id/policies/$pol_id/make_reusable" \
+              -H "Authorization: Bearer $token" \
+              -H "Content-Type: application/json")"
+            echo "$conv" | jq -e '.success == true' >/dev/null
+            echo "✅ Converted to reusable policy"
+          else
+            echo "♻️ Policy exists: $pol_id"
+            echo "🔧 Updating reusable policy include list..."
+
+            # Try reusable policy GET
+            get_reusable="$(curl -sS -X GET \
+              "https://api.cloudflare.com/client/v4/accounts/$acct/access/policies/$pol_id" \
+              -H "Authorization: Bearer $token" \
+              -H "Content-Type: application/json" || true)"
+
+            if echo "$get_reusable" | jq -e '.success == true' >/dev/null 2>&1; then
+              updated_payload="$(echo "$get_reusable" | jq --argjson include "$emails_json" '
+                .result
+                | .include = $include
+              ')"
+
+              put="$(curl -sS -X PUT \
+                "https://api.cloudflare.com/client/v4/accounts/$acct/access/policies/$pol_id" \
+                -H "Authorization: Bearer $token" \
+                -H "Content-Type: application/json" \
+                --data "$updated_payload")"
+              echo "$put" | jq -e '.success == true' >/dev/null
+              echo "✅ Updated reusable policy"
+            else
+              echo "⚠️ Could not GET as reusable; attempting conversion to reusable..."
+
+              conv2="$(curl -sS -X PUT \
+                "https://api.cloudflare.com/client/v4/accounts/$acct/access/apps/$app_id/policies/$pol_id/make_reusable" \
+                -H "Authorization: Bearer $token" \
+                -H "Content-Type: application/json" || true)"
+
+              if echo "$conv2" | jq -e '.success == true' >/dev/null 2>&1; then
+                echo "✅ Converted existing policy to reusable"
+
+                get_reusable2="$(curl -sS -X GET \
+                  "https://api.cloudflare.com/client/v4/accounts/$acct/access/policies/$pol_id" \
+                  -H "Authorization: Bearer $token" \
+                  -H "Content-Type: application/json")"
+                echo "$get_reusable2" | jq -e '.success == true' >/dev/null
+
+                updated_payload2="$(echo "$get_reusable2" | jq --argjson include "$emails_json" '
+                  .result
+                  | .include = $include
+                ')"
+
+                put2="$(curl -sS -X PUT \
+                  "https://api.cloudflare.com/client/v4/accounts/$acct/access/policies/$pol_id" \
+                  -H "Authorization: Bearer $token" \
+                  -H "Content-Type: application/json" \
+                  --data "$updated_payload2")"
+                echo "$put2" | jq -e '.success == true' >/dev/null
+                echo "✅ Updated reusable policy"
+              else
+                echo "⚠️ Conversion not possible; updating as legacy app policy (best-effort)..."
+
+              # Legacy update path (best-effort)
+              legacy_get="$(curl -sS -X GET \
+                "https://api.cloudflare.com/client/v4/accounts/$acct/access/apps/$app_id/policies/$pol_id" \
+                -H "Authorization: Bearer $token" \
+                -H "Content-Type: application/json")"
+              echo "$legacy_get" | jq -e '.success == true' >/dev/null
+
+              legacy_payload="$(echo "$legacy_get" | jq --argjson include "$emails_json" '
+                .result | .include = $include
+              ')"
+
+              legacy_put="$(curl -sS -X PUT \
+                "https://api.cloudflare.com/client/v4/accounts/$acct/access/apps/$app_id/policies/$pol_id" \
+                -H "Authorization: Bearer $token" \
+                -H "Content-Type: application/json" \
+                --data "$legacy_payload")"
+              echo "$legacy_put" | jq -e '.success == true' >/dev/null
+              echo "✅ Updated legacy policy"
+              fi
+            fi
+          fi
+
+          echo "POLICY_ID=$pol_id" >> "$GITHUB_OUTPUT"
+
+      - name: ✅ Post-check - Access gate is in front
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          url="https://${{ steps.host.outputs.HOST }}"
+          echo "🌐 Post-check request: $url"
+
+          # We expect Access to intercept unauthenticated traffic (commonly 302 to /cdn-cgi/access/login)
+          headers="$(curl -sS -I "$url" || true)"
+          echo "$headers"
+
+          if echo "$headers" | grep -qi "cdn-cgi/access"; then
+            echo "✅ Access intercept detected"
+          else
+            echo "⚠️ Could not confirm Access intercept from headers alone."
+            echo "   (This can happen depending on redirects / caching / existing auth.)"
+          fi
+
+      - name: ✅ Final summary
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          {
+            echo "## Cloudflare Zero Trust Access - Result"
+            echo ""
+            echo "- ✅ Token verified"
+            echo "- ✅ One-time PIN IdP ensured"
+            echo "- ✅ Access app ensured: \`${{ steps.app.outputs.APP_ID }}\`"
+            echo "- ✅ Policy ensured: \`${{ steps.policy.outputs.POLICY_ID }}\`"
+            echo "- ✅ Target: \`${{ steps.host.outputs.HOST }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "✅ Done. See job summary for the checklist."

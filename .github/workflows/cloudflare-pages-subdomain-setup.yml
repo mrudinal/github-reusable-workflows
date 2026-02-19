@@ -2,6 +2,31 @@ name: "Cloudflare Pages: attach custom domain + redirect pages.dev"
 
 on:
   workflow_call:
+    inputs:
+      PAGES_PROJECT_NAME:
+        description: 'Cloudflare Pages project name (project must already exist)'
+        required: true
+        type: string
+      PAGES_DEV_HOSTNAME:
+        description: 'Default Pages hostname to redirect (no scheme), e.g. my-site.pages.dev'
+        required: true
+        type: string
+      CUSTOM_DOMAIN:
+        description: 'Custom domain to attach + redirect to, e.g. www.example.com'
+        required: true
+        type: string
+      BULK_REDIRECT_LIST_NAME:
+        description: 'Optional: override Bulk Redirect list name'
+        required: false
+        type: string
+      BULK_REDIRECT_RULE_REF:
+        description: 'Optional: override redirect rule ref'
+        required: false
+        type: string
+      BULK_REDIRECT_RULESET_NAME:
+        description: 'Optional: override entrypoint ruleset name/description'
+        required: false
+        type: string
     secrets:
       CLOUDFLARE_API_TOKEN:
         required: true
@@ -9,28 +34,6 @@ on:
         required: true
       CLOUDFLARE_ZONE_ID:
         required: true
-
-      # Pages project info (project must already exist; you create it manually)
-      PAGES_PROJECT_NAME:
-        required: true
-
-      # The default Pages hostname you want to “disable” via redirect (no scheme)
-      # Example: masage-website.pages.dev
-      PAGES_DEV_HOSTNAME:
-        required: true
-
-      # The custom domain you want to use (full hostname)
-      # Example: centrodebienestar.negociosprivadoscr.com
-      CUSTOM_DOMAIN:
-        required: true
-
-      # Optional overrides (leave unset to auto-generate safe names)
-      BULK_REDIRECT_LIST_NAME:
-        required: false
-      BULK_REDIRECT_RULE_REF:
-        required: false
-      BULK_REDIRECT_RULESET_NAME:
-        required: false
 
 jobs:
   setup:
@@ -49,13 +52,13 @@ jobs:
           CF_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           CF_ZONE_ID: ${{ secrets.CLOUDFLARE_ZONE_ID }}
 
-          PAGES_PROJECT: ${{ secrets.PAGES_PROJECT_NAME }}
-          PAGES_DEV_HOST: ${{ secrets.PAGES_DEV_HOSTNAME }}
-          CUSTOM_DOMAIN: ${{ secrets.CUSTOM_DOMAIN }}
+          PAGES_PROJECT: ${{ inputs.PAGES_PROJECT_NAME }}
+          PAGES_DEV_HOST: ${{ inputs.PAGES_DEV_HOSTNAME }}
+          CUSTOM_DOMAIN: ${{ inputs.CUSTOM_DOMAIN }}
 
-          OVERRIDE_LIST_NAME: ${{ secrets.BULK_REDIRECT_LIST_NAME }}
-          OVERRIDE_RULE_REF: ${{ secrets.BULK_REDIRECT_RULE_REF }}
-          OVERRIDE_RULESET_NAME: ${{ secrets.BULK_REDIRECT_RULESET_NAME }}
+          OVERRIDE_LIST_NAME: ${{ inputs.BULK_REDIRECT_LIST_NAME }}
+          OVERRIDE_RULE_REF: ${{ inputs.BULK_REDIRECT_RULE_REF }}
+          OVERRIDE_RULESET_NAME: ${{ inputs.BULK_REDIRECT_RULESET_NAME }}
         run: |
           set -euo pipefail
 

@@ -2,29 +2,43 @@ name: Reusable - Cloudflare Zero Trust Access (One-time PIN gate)
 
 on:
   workflow_call:
+    inputs:
+      # Access app settings
+      CF_ACCESS_APP_NAME:
+        description: 'Access application name'
+        required: true
+        type: string
+      CF_ACCESS_DOMAIN:
+        description: 'Base domain, e.g. example.com'
+        required: true
+        type: string
+      CF_ACCESS_SUBDOMAIN:
+        description: 'Subdomain, e.g. app (use @ for apex)'
+        required: true
+        type: string
+      CF_ACCESS_PATH:
+        description: 'Optional path, e.g. /admin (empty means whole hostname)'
+        required: false
+        type: string
+      CF_ACCESS_SESSION_DURATION:
+        description: 'Session duration, e.g. 24h'
+        required: true
+        type: string
+
+      # Policy settings
+      CF_ACCESS_POLICY_NAME:
+        description: 'Policy name, e.g. Allowed_emails'
+        required: true
+        type: string
+      CF_ALLOWED_EMAILS:
+        description: 'Comma-separated emails, e.g. a@b.com,c@d.com'
+        required: true
+        type: string
     secrets:
       CF_API_TOKEN:
         required: true
       CF_ACCOUNT_ID:
         required: true
-
-      # Access app settings (you asked to pass everything as secrets)
-      CF_ACCESS_APP_NAME:
-        required: true
-      CF_ACCESS_DOMAIN:
-        required: true  # e.g. negociosprivadoscr.com
-      CF_ACCESS_SUBDOMAIN:
-        required: true  # e.g. centrodebienestar   (use @ for apex)
-      CF_ACCESS_PATH:
-        required: false # e.g. / (empty means whole hostname)
-      CF_ACCESS_SESSION_DURATION:
-        required: true  # e.g. 24h
-
-      # Policy settings
-      CF_ACCESS_POLICY_NAME:
-        required: true  # e.g. Allowed_emails
-      CF_ALLOWED_EMAILS:
-        required: true  # comma-separated: a@b.com,c@d.com
 
 jobs:
   configure-access:
@@ -33,14 +47,14 @@ jobs:
       CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
       CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
 
-      CF_ACCESS_APP_NAME: ${{ secrets.CF_ACCESS_APP_NAME }}
-      CF_ACCESS_DOMAIN: ${{ secrets.CF_ACCESS_DOMAIN }}
-      CF_ACCESS_SUBDOMAIN: ${{ secrets.CF_ACCESS_SUBDOMAIN }}
-      CF_ACCESS_PATH: ${{ secrets.CF_ACCESS_PATH }}
-      CF_ACCESS_SESSION_DURATION: ${{ secrets.CF_ACCESS_SESSION_DURATION }}
+      CF_ACCESS_APP_NAME: ${{ inputs.CF_ACCESS_APP_NAME }}
+      CF_ACCESS_DOMAIN: ${{ inputs.CF_ACCESS_DOMAIN }}
+      CF_ACCESS_SUBDOMAIN: ${{ inputs.CF_ACCESS_SUBDOMAIN }}
+      CF_ACCESS_PATH: ${{ inputs.CF_ACCESS_PATH }}
+      CF_ACCESS_SESSION_DURATION: ${{ inputs.CF_ACCESS_SESSION_DURATION }}
 
-      CF_ACCESS_POLICY_NAME: ${{ secrets.CF_ACCESS_POLICY_NAME }}
-      CF_ALLOWED_EMAILS: ${{ secrets.CF_ALLOWED_EMAILS }}
+      CF_ACCESS_POLICY_NAME: ${{ inputs.CF_ACCESS_POLICY_NAME }}
+      CF_ALLOWED_EMAILS: ${{ inputs.CF_ALLOWED_EMAILS }}
     steps:
       - name: ✅ Preflight - tools + inputs
         shell: bash

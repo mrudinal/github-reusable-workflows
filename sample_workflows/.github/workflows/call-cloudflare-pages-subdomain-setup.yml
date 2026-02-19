@@ -1,0 +1,57 @@
+# Calls the reusable workflow in the "github-reusable-workflows" repo to:
+# - Create/ensure a proxied CNAME: CUSTOM_DOMAIN -> PAGES_DEV_HOSTNAME
+# - Attach CUSTOM_DOMAIN to an existing Cloudflare Pages project
+# - Create a Bulk Redirect so https://<project>.pages.dev/* redirects to https://CUSTOM_DOMAIN
+#
+# Required GitHub Secrets in *this* repository:
+# - CLOUDFLARE_API_TOKEN
+# - CLOUDFLARE_ACCOUNT_ID
+# - CLOUDFLARE_ZONE_ID
+#
+# Note: Update the `uses:` line to point at your workflow repo + ref.
+
+name: "Cloudflare Pages: attach custom domain + redirect pages.dev (caller)"
+
+on:
+  workflow_dispatch:
+    inputs:
+      PAGES_PROJECT_NAME:
+        description: "Cloudflare Pages project name (must already exist)"
+        required: true
+        type: string
+      PAGES_DEV_HOSTNAME:
+        description: "Default Pages hostname to redirect (no scheme), e.g. my-site.pages.dev"
+        required: true
+        type: string
+      CUSTOM_DOMAIN:
+        description: "Custom domain to attach + redirect to, e.g. www.example.com"
+        required: true
+        type: string
+      BULK_REDIRECT_LIST_NAME:
+        description: "Optional: override Bulk Redirect list name"
+        required: false
+        type: string
+      BULK_REDIRECT_RULE_REF:
+        description: "Optional: override redirect rule ref"
+        required: false
+        type: string
+      BULK_REDIRECT_RULESET_NAME:
+        description: "Optional: override entrypoint ruleset name/description"
+        required: false
+        type: string
+
+jobs:
+  call-reusable:
+    name: "Configure Cloudflare Pages domain + redirects"
+    uses: Max/github-reusable-workflows/.github/workflows/cloudflare-pages-subdomain-setup.yml@main
+    with:
+      PAGES_PROJECT_NAME: ${{ inputs.PAGES_PROJECT_NAME }}
+      PAGES_DEV_HOSTNAME: ${{ inputs.PAGES_DEV_HOSTNAME }}
+      CUSTOM_DOMAIN: ${{ inputs.CUSTOM_DOMAIN }}
+      BULK_REDIRECT_LIST_NAME: ${{ inputs.BULK_REDIRECT_LIST_NAME }}
+      BULK_REDIRECT_RULE_REF: ${{ inputs.BULK_REDIRECT_RULE_REF }}
+      BULK_REDIRECT_RULESET_NAME: ${{ inputs.BULK_REDIRECT_RULESET_NAME }}
+    secrets:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      CLOUDFLARE_ZONE_ID: ${{ secrets.CLOUDFLARE_ZONE_ID }}

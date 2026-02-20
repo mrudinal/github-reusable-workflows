@@ -39,6 +39,10 @@ on:
         description: "Optional: override entrypoint ruleset name/description"
         required: false
         type: string
+      REDIRECT_STATUS_CODE:
+        description: "Optional: redirect HTTP status code (301, 302, 307, 308). Default: 302"
+        required: false
+        type: string
 
 jobs:
   call-reusable:
@@ -51,6 +55,7 @@ jobs:
       BULK_REDIRECT_LIST_NAME: ${{ inputs.BULK_REDIRECT_LIST_NAME }}
       BULK_REDIRECT_RULE_REF: ${{ inputs.BULK_REDIRECT_RULE_REF }}
       BULK_REDIRECT_RULESET_NAME: ${{ inputs.BULK_REDIRECT_RULESET_NAME }}
+      REDIRECT_STATUS_CODE: ${{ inputs.REDIRECT_STATUS_CODE }}
     secrets:
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}

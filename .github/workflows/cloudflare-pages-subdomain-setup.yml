@@ -27,6 +27,10 @@ on:
         description: 'Optional: override entrypoint ruleset name/description'
         required: false
         type: string
+      REDIRECT_STATUS_CODE:
+        description: 'Optional: redirect HTTP status code (301, 302, 307, 308). Default: 302'
+        required: false
+        type: string
     secrets:
       CLOUDFLARE_API_TOKEN:
         required: true
@@ -59,6 +63,7 @@ jobs:
           OVERRIDE_LIST_NAME: ${{ inputs.BULK_REDIRECT_LIST_NAME }}
           OVERRIDE_RULE_REF: ${{ inputs.BULK_REDIRECT_RULE_REF }}
           OVERRIDE_RULESET_NAME: ${{ inputs.BULK_REDIRECT_RULESET_NAME }}
+          REDIRECT_STATUS_CODE: ${{ inputs.REDIRECT_STATUS_CODE }}
         run: |
           set -euo pipefail
 
@@ -107,6 +112,11 @@ jobs:
           PAGES_DEV_URL="https://${PAGES_DEV_HOST}"
           TARGET_URL="https://${CUSTOM_DOMAIN}"
 
+          STATUS_CODE="${REDIRECT_STATUS_CODE:-302}"
+          if ! [[ "$STATUS_CODE" =~ ^(301|302|307|308)$ ]]; then
+            die "Invalid REDIRECT_STATUS_CODE: $STATUS_CODE (allowed: 301, 302, 307, 308)"
+          fi
+
           # Cloudflare "list variables" work best with [A-Za-z0-9_]
           # If user didn't provide a list name, generate one from project + domain
           RAW_LIST_NAME="${OVERRIDE_LIST_NAME:-pagesdev_to_${CUSTOM_DOMAIN}}"
@@ -121,6 +131,7 @@ jobs:
           echo "  PAGES_DEV_HOST=${PAGES_DEV_HOST}"
           echo "  LIST_NAME=${LIST_NAME}"
           echo "  RULE_REF=${RULE_REF}"
+          echo "  STATUS_CODE=${STATUS_CODE}"
           ok "Names derived"
           end_group
 
@@ -238,11 +249,12 @@ jobs:
           items_payload="$(jq -n \
             --arg source "${PAGES_DEV_URL}/*" \
             --arg target "${TARGET_URL}" \
+            --argjson status_code "${STATUS_CODE}" \
             '[{
               redirect: {
                 source_url: $source,
                 target_url: $target,
-                status_code: 301,
+                status_code: $status_code,
                 include_subdomains: true,
                 subpath_matching: true,
                 preserve_query_string: true,

@@ -13,7 +13,8 @@ This repository also contains GitHub Actions workflows (YAML) used as reusable w
 ## GitHub Actions workflows (YAML) — repo rules (must)
 
 ### Workflow interface (must)
-* Reusable workflows that are intended to be called from other repositories must declare non-secret parameters under `on.workflow_call.inputs`.
+* Reusable workflows that are intended to be called from other repositories must get non-secret configuration from **caller repository variables** (`vars.*`) where possible.
+  * If caller variables are not feasible for a workflow, declare non-secret parameters under `on.workflow_call.inputs`.
 * Sensitive values (tokens/credentials) must be declared under `on.workflow_call.secrets` and passed via `jobs.<job_id>.secrets` from the caller.
 
 ### Safety and logging (must)

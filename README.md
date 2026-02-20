@@ -16,7 +16,7 @@ Given an existing Cloudflare Pages project (already connected to a Git repo manu
 2) Adds `CUSTOM_DOMAIN` to the **Pages project** (so Cloudflare issues TLS + serves it)
 
 3) Creates a **Bulk Redirect list** + item:
-- `https://PAGES_DEV_HOSTNAME/*` → `https://CUSTOM_DOMAIN/*` (301)
+- `https://PAGES_DEV_HOSTNAME/*` → `https://CUSTOM_DOMAIN/*` (301 by default)
 - Preserves path + query string
 - Subpath matching enabled
 
@@ -42,14 +42,18 @@ Cloudflare Pages always has a `*.pages.dev` hostname. You cannot truly remove it
 - `CLOUDFLARE_API_TOKEN`
 - `CLOUDFLARE_ACCOUNT_ID`
 - `CLOUDFLARE_ZONE_ID`
+
+### Required repository variables (in the calling repo)
+
 - `PAGES_PROJECT_NAME`
 - `PAGES_DEV_HOSTNAME` (example: `masage-website.pages.dev`)
 - `CUSTOM_DOMAIN` (example: `centrodebienestar.negociosprivadoscr.com`)
 
-Optional secrets:
+Optional repository variables:
 - `BULK_REDIRECT_LIST_NAME` (must be identifier-safe; otherwise it’s auto-generated)
 - `BULK_REDIRECT_RULE_REF`
 - `BULK_REDIRECT_RULESET_NAME`
+- `REDIRECT_STATUS_CODE` (301, 302, 307, 308; default 301)
 
 ### Example: calling this workflow from another repo
 
@@ -67,9 +71,6 @@ jobs:
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
       CLOUDFLARE_ZONE_ID: ${{ secrets.CLOUDFLARE_ZONE_ID }}
-      PAGES_PROJECT_NAME: ${{ secrets.PAGES_PROJECT_NAME }}
-      PAGES_DEV_HOSTNAME: ${{ secrets.PAGES_DEV_HOSTNAME }}
-      CUSTOM_DOMAIN: ${{ secrets.CUSTOM_DOMAIN }}
 ~~~
 
 ---
@@ -104,14 +105,18 @@ Docs: `docs/cloudflare-zerotrust-access-otp.md`
 - `CF_API_TOKEN`
 - `CF_ACCOUNT_ID`
 
+### Required repository variables (in the calling repo)
+
 - `CF_ACCESS_APP_NAME` (e.g. `Centro de Bienestar`)
 - `CF_ACCESS_DOMAIN` (e.g. `negociosprivadoscr.com`)
 - `CF_ACCESS_SUBDOMAIN` (e.g. `centrodebienestar` or `@` for apex/root)
-- `CF_ACCESS_PATH` (optional, e.g. `/centrodebienestar` — leave empty to protect whole hostname)
 - `CF_ACCESS_SESSION_DURATION` (e.g. `24h`)
 
 - `CF_ACCESS_POLICY_NAME` (e.g. `Allowed_emails`)
 - `CF_ALLOWED_EMAILS` (comma-separated, e.g. `rudin.max87@gmail.com,other@domain.com`)
+
+Optional repository variables:
+- `CF_ACCESS_PATH` (optional, e.g. `/centrodebienestar` — leave empty to protect whole hostname)
 
 ### How to call it from another repo
 
@@ -127,13 +132,4 @@ jobs:
     secrets:
       CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
       CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
-
-      CF_ACCESS_APP_NAME: ${{ secrets.CF_ACCESS_APP_NAME }}
-      CF_ACCESS_DOMAIN: ${{ secrets.CF_ACCESS_DOMAIN }}
-      CF_ACCESS_SUBDOMAIN: ${{ secrets.CF_ACCESS_SUBDOMAIN }}
-      CF_ACCESS_PATH: ${{ secrets.CF_ACCESS_PATH }}
-      CF_ACCESS_SESSION_DURATION: ${{ secrets.CF_ACCESS_SESSION_DURATION }}
-
-      CF_ACCESS_POLICY_NAME: ${{ secrets.CF_ACCESS_POLICY_NAME }}
-      CF_ALLOWED_EMAILS: ${{ secrets.CF_ALLOWED_EMAILS }}
 ~~~

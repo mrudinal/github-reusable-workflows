@@ -6,55 +6,28 @@
 # - CF_API_TOKEN
 # - CF_ACCOUNT_ID
 #
+# Required GitHub Variables in *this* repository:
+# - CF_ACCESS_APP_NAME
+# - CF_ACCESS_DOMAIN
+# - CF_ACCESS_SUBDOMAIN
+# - CF_ACCESS_SESSION_DURATION
+# - CF_ACCESS_POLICY_NAME
+# - CF_ALLOWED_EMAILS
+#
+# Optional GitHub Variables in *this* repository:
+# - CF_ACCESS_PATH
+#
 # Note: Update the `uses:` line to point at your workflow repo + ref.
 
 name: "Cloudflare Zero Trust Access: One-time PIN gate (caller)"
 
 on:
   workflow_dispatch:
-    inputs:
-      CF_ACCESS_APP_NAME:
-        description: "Access application name"
-        required: true
-        type: string
-      CF_ACCESS_DOMAIN:
-        description: "Base domain, e.g. example.com"
-        required: true
-        type: string
-      CF_ACCESS_SUBDOMAIN:
-        description: "Subdomain, e.g. app (use @ for apex)"
-        required: true
-        type: string
-      CF_ACCESS_PATH:
-        description: "Optional path, e.g. /admin (empty means whole hostname)"
-        required: false
-        type: string
-      CF_ACCESS_SESSION_DURATION:
-        description: "Session duration, e.g. 24h"
-        required: true
-        type: string
-      CF_ACCESS_POLICY_NAME:
-        description: "Policy name, e.g. Allowed_emails"
-        required: true
-        type: string
-      CF_ALLOWED_EMAILS:
-        description: "Comma-separated emails, e.g. a@b.com,c@d.com"
-        required: true
-        type: string
 
 jobs:
   call-reusable:
     name: "Configure Cloudflare Zero Trust Access"
     uses: Max/github-reusable-workflows/.github/workflows/cloudflare-zerotrust-access-otp.yml@main
-    with:
-      CF_ACCESS_APP_NAME: ${{ inputs.CF_ACCESS_APP_NAME }}
-      CF_ACCESS_DOMAIN: ${{ inputs.CF_ACCESS_DOMAIN }}
-      CF_ACCESS_SUBDOMAIN: ${{ inputs.CF_ACCESS_SUBDOMAIN }}
-      CF_ACCESS_PATH: ${{ inputs.CF_ACCESS_PATH }}
-      CF_ACCESS_SESSION_DURATION: ${{ inputs.CF_ACCESS_SESSION_DURATION }}
-
-      CF_ACCESS_POLICY_NAME: ${{ inputs.CF_ACCESS_POLICY_NAME }}
-      CF_ALLOWED_EMAILS: ${{ inputs.CF_ALLOWED_EMAILS }}
     secrets:
       CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
       CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}

@@ -2,35 +2,6 @@ name: "Cloudflare Pages: attach custom domain + redirect pages.dev"
 
 on:
   workflow_call:
-    inputs:
-      PAGES_PROJECT_NAME:
-        description: 'Cloudflare Pages project name (project must already exist)'
-        required: true
-        type: string
-      PAGES_DEV_HOSTNAME:
-        description: 'Default Pages hostname to redirect (no scheme), e.g. my-site.pages.dev'
-        required: true
-        type: string
-      CUSTOM_DOMAIN:
-        description: 'Custom domain to attach + redirect to, e.g. www.example.com'
-        required: true
-        type: string
-      BULK_REDIRECT_LIST_NAME:
-        description: 'Optional: override Bulk Redirect list name'
-        required: false
-        type: string
-      BULK_REDIRECT_RULE_REF:
-        description: 'Optional: override redirect rule ref'
-        required: false
-        type: string
-      BULK_REDIRECT_RULESET_NAME:
-        description: 'Optional: override entrypoint ruleset name/description'
-        required: false
-        type: string
-      REDIRECT_STATUS_CODE:
-        description: 'Optional: redirect HTTP status code (301, 302, 307, 308). Default: 302'
-        required: false
-        type: string
     secrets:
       CLOUDFLARE_API_TOKEN:
         required: true
@@ -56,14 +27,14 @@ jobs:
           CF_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           CF_ZONE_ID: ${{ secrets.CLOUDFLARE_ZONE_ID }}
 
-          PAGES_PROJECT: ${{ inputs.PAGES_PROJECT_NAME }}
-          PAGES_DEV_HOST: ${{ inputs.PAGES_DEV_HOSTNAME }}
-          CUSTOM_DOMAIN: ${{ inputs.CUSTOM_DOMAIN }}
+          PAGES_PROJECT: ${{ vars.PAGES_PROJECT_NAME }}
+          PAGES_DEV_HOST: ${{ vars.PAGES_DEV_HOSTNAME }}
+          CUSTOM_DOMAIN: ${{ vars.CUSTOM_DOMAIN }}
 
-          OVERRIDE_LIST_NAME: ${{ inputs.BULK_REDIRECT_LIST_NAME }}
-          OVERRIDE_RULE_REF: ${{ inputs.BULK_REDIRECT_RULE_REF }}
-          OVERRIDE_RULESET_NAME: ${{ inputs.BULK_REDIRECT_RULESET_NAME }}
-          REDIRECT_STATUS_CODE: ${{ inputs.REDIRECT_STATUS_CODE }}
+          OVERRIDE_LIST_NAME: ${{ vars.BULK_REDIRECT_LIST_NAME }}
+          OVERRIDE_RULE_REF: ${{ vars.BULK_REDIRECT_RULE_REF }}
+          OVERRIDE_RULESET_NAME: ${{ vars.BULK_REDIRECT_RULESET_NAME }}
+          REDIRECT_STATUS_CODE: ${{ vars.REDIRECT_STATUS_CODE }}
         run: |
           set -euo pipefail
 
@@ -74,6 +45,38 @@ jobs:
           end_group() { echo "::endgroup::"; }
           ok() { echo "✔ $1"; SUMMARY_OK+=("$1"); }
           warn() { echo "! $1"; SUMMARY_WARN+=("$1"); }
+
+          to_identifier() {
+            echo "$1" | sed 's/[^A-Za-z0-9_\-]/_/g'
+          }
+
+          wait_for_list_bulk_operation() {
+            local operation_id="$1"
+            local label="$2"
+
+            [[ -n "${operation_id:-}" ]] || die "Missing operation_id for ${label}"
+
+            echo "Waiting for list operation to complete (${label}): ${operation_id}"
+            local op_response=""
+            for attempt in {1..30}; do
+              op_response="$(cf GET "/accounts/${CF_ACCOUNT_ID}/rules/lists/bulk_operations/${operation_id}")"
+              echo "$op_response" | jq -e '.success == true' >/dev/null || die "Bulk op status failed: $(echo "$op_response" | jq -c '.errors')"
+              local op_status
+              op_status="$(echo "$op_response" | jq -r '.result.status')"
+              echo "  status=${op_status}"
+              if [[ "$op_status" == "completed" ]]; then
+                return 0
+              fi
+              if [[ "$op_status" == "failed" ]]; then
+                die "Bulk operation failed (${label}): $(echo "$op_response" | jq -c '.result')"
+              fi
+              sleep 2
+            done
+
+            local final_status
+            final_status="$(echo "$op_response" | jq -r '.result.status // empty')"
+            die "Bulk operation did not complete (${label}). status=${final_status}"
+          }
 
           cf() {
             local method="$1"
@@ -95,14 +98,14 @@ jobs:
 
           die() { echo "::error::$1"; exit 1; }
 
-          start_group "0) Validate inputs"
+          start_group "0) Validate configuration (vars + secrets)"
           [[ -n "${CF_API_TOKEN:-}" ]] || die "Missing CF_API_TOKEN"
           [[ -n "${CF_ACCOUNT_ID:-}" ]] || die "Missing CF_ACCOUNT_ID"
           [[ -n "${CF_ZONE_ID:-}" ]] || die "Missing CF_ZONE_ID"
           [[ -n "${PAGES_PROJECT:-}" ]] || die "Missing PAGES_PROJECT"
           [[ -n "${PAGES_DEV_HOST:-}" ]] || die "Missing PAGES_DEV_HOST"
           [[ -n "${CUSTOM_DOMAIN:-}" ]] || die "Missing CUSTOM_DOMAIN"
-          ok "Inputs present"
+          ok "Required vars/secrets present"
           end_group
 
           # -------------------------
@@ -112,7 +115,7 @@ jobs:
           PAGES_DEV_URL="https://${PAGES_DEV_HOST}"
           TARGET_URL="https://${CUSTOM_DOMAIN}"
 
-          STATUS_CODE="${REDIRECT_STATUS_CODE:-302}"
+          STATUS_CODE="${REDIRECT_STATUS_CODE:-301}"
           if ! [[ "$STATUS_CODE" =~ ^(301|302|307|308)$ ]]; then
             die "Invalid REDIRECT_STATUS_CODE: $STATUS_CODE (allowed: 301, 302, 307, 308)"
           fi
@@ -122,7 +125,9 @@ jobs:
           RAW_LIST_NAME="${OVERRIDE_LIST_NAME:-pagesdev_to_${CUSTOM_DOMAIN}}"
           LIST_NAME="$(echo "$RAW_LIST_NAME" | sed 's/[^A-Za-z0-9_]/_/g')"
 
-          RULE_REF="${OVERRIDE_RULE_REF:-redirect_pagesdev_to_custom_${LIST_NAME}}"
+          RULE_REF_RAW="${OVERRIDE_RULE_REF:-redirect_pagesdev_to_custom_${LIST_NAME}}"
+          RULE_REF="$(to_identifier "$RULE_REF_RAW")"
+          RULE_DESCRIPTION="${OVERRIDE_RULE_REF:-Redirect ${PAGES_DEV_HOST} to ${CUSTOM_DOMAIN}}"
           RULESET_NAME="${OVERRIDE_RULESET_NAME:-Bulk Redirects (managed by GitHub Actions)}"
 
           echo "Using:"
@@ -131,6 +136,7 @@ jobs:
           echo "  PAGES_DEV_HOST=${PAGES_DEV_HOST}"
           echo "  LIST_NAME=${LIST_NAME}"
           echo "  RULE_REF=${RULE_REF}"
+          echo "  RULE_DESCRIPTION=${RULE_DESCRIPTION}"
           echo "  STATUS_CODE=${STATUS_CODE}"
           ok "Names derived"
           end_group
@@ -145,6 +151,8 @@ jobs:
           echo "$dns_search" | jq -e '.success == true' >/dev/null || die "DNS search failed: $(echo "$dns_search" | jq -c '.errors')"
 
           record_id="$(echo "$dns_search" | jq -r '.result[0].id // empty')"
+          existing_dns_content="$(echo "$dns_search" | jq -r '.result[0].content // empty')"
+          existing_dns_proxied="$(echo "$dns_search" | jq -r '.result[0].proxied // empty')"
 
           dns_payload="$(jq -n \
             --arg type "CNAME" \
@@ -156,10 +164,15 @@ jobs:
           )"
 
           if [[ -n "$record_id" ]]; then
-            echo "Updating existing CNAME record id=${record_id}"
-            dns_upd="$(cf PUT "/zones/${CF_ZONE_ID}/dns_records/${record_id}" "$dns_payload")"
-            echo "$dns_upd" | jq -e '.success == true' >/dev/null || die "DNS update failed: $(echo "$dns_upd" | jq -c '.errors')"
-            dns_result="$dns_upd"
+            if [[ "$existing_dns_content" == "${PAGES_DEV_HOST}" && "$existing_dns_proxied" == "true" ]]; then
+              echo "DNS CNAME already correct (id=${record_id}). Skipping update."
+              dns_result="$dns_search"
+            else
+              echo "Updating existing CNAME record id=${record_id}"
+              dns_upd="$(cf PUT "/zones/${CF_ZONE_ID}/dns_records/${record_id}" "$dns_payload")"
+              echo "$dns_upd" | jq -e '.success == true' >/dev/null || die "DNS update failed: $(echo "$dns_upd" | jq -c '.errors')"
+              dns_result="$dns_upd"
+            fi
           else
             echo "Creating new CNAME record"
             dns_new="$(cf POST "/zones/${CF_ZONE_ID}/dns_records" "$dns_payload")"
@@ -202,12 +215,16 @@ jobs:
           ok "Pages custom domain attached (status=${domain_status})"
 
           # Optional: trigger a validation retry (safe/no-op if already active)
-          echo "Retrying domain validation (optional)..."
-          domain_retry="$(cf PATCH "/accounts/${CF_ACCOUNT_ID}/pages/projects/${PAGES_PROJECT}/domains/${CUSTOM_DOMAIN}" '{}')"
-          if echo "$domain_retry" | jq -e '.success == true' >/dev/null; then
-            ok "Pages validation retry requested"
+          if [[ "$domain_status" == "active" ]]; then
+            echo "Pages domain is active; skipping validation retry."
           else
-            warn "Pages validation retry not applied (non-fatal)"
+            echo "Retrying domain validation (optional)..."
+            domain_retry="$(cf PATCH "/accounts/${CF_ACCOUNT_ID}/pages/projects/${PAGES_PROJECT}/domains/${CUSTOM_DOMAIN}" '{}')"
+            if echo "$domain_retry" | jq -e '.success == true' >/dev/null; then
+              ok "Pages validation retry requested"
+            else
+              warn "Pages validation retry not applied (non-fatal)"
+            fi
           fi
           end_group
 
@@ -219,7 +236,7 @@ jobs:
           lists="$(cf GET "/accounts/${CF_ACCOUNT_ID}/rules/lists?per_page=100")"
           echo "$lists" | jq -e '.success == true' >/dev/null || die "List fetch failed: $(echo "$lists" | jq -c '.errors')"
 
-          list_id="$(echo "$lists" | jq -r --arg n "${LIST_NAME}" '.result[] | select(.name==$n and .kind=="redirect") | .id' | head -n 1)"
+          list_id="$(echo "$lists" | jq -r --arg list_name "${LIST_NAME}" '.result[] | select(.name==$list_name and .kind=="redirect") | .id' | head -n 1)"
 
           if [[ -z "$list_id" ]]; then
             echo "Creating list ${LIST_NAME}..."
@@ -245,10 +262,52 @@ jobs:
           #    (async bulk operation, we poll until completed)
           # -------------------------
           start_group "4) Bulk Redirects: add list item"
-          echo "Adding/updating redirect item in list..."
+          echo "Adding/updating redirect item in list (idempotent)..."
+
+          list_item_already_correct="false"
+
+          desired_source="${PAGES_DEV_URL}/*"
+          desired_target="${TARGET_URL}"
+
+          existing_items="$(cf GET "/accounts/${CF_ACCOUNT_ID}/rules/lists/${list_id}/items?per_page=100")"
+          echo "$existing_items" | jq -e '.success == true' >/dev/null || die "List items fetch failed: $(echo "$existing_items" | jq -c '.errors')"
+
+          existing_item_id="$(echo "$existing_items" | jq -r --arg source "$desired_source" '.result[]? | select(.redirect.source_url? == $source) | .id' | head -n 1)"
+          existing_item_json="$(echo "$existing_items" | jq -c --arg source "$desired_source" '.result[]? | select(.redirect.source_url? == $source)' | head -n 1)"
+
+          if [[ -n "${existing_item_id:-}" ]]; then
+            existing_target="$(echo "$existing_item_json" | jq -r '.redirect.target_url // empty')"
+            existing_status_code="$(echo "$existing_item_json" | jq -r '.redirect.status_code // empty')"
+            existing_preserve_query_string="$(echo "$existing_item_json" | jq -r '.redirect.preserve_query_string // empty')"
+            existing_preserve_path_suffix="$(echo "$existing_item_json" | jq -r '.redirect.preserve_path_suffix // empty')"
+            existing_subpath_matching="$(echo "$existing_item_json" | jq -r '.redirect.subpath_matching // empty')"
+            existing_include_subdomains="$(echo "$existing_item_json" | jq -r '.redirect.include_subdomains // empty')"
+
+            if [[ "$existing_target" == "$desired_target" \
+              && "$existing_status_code" == "$STATUS_CODE" \
+              && "$existing_preserve_query_string" == "true" \
+              && "$existing_preserve_path_suffix" == "true" \
+              && "$existing_subpath_matching" == "true" \
+              && "$existing_include_subdomains" == "true" ]]; then
+              echo "List item already exists with desired configuration (id=${existing_item_id}). Skipping."
+              ok "Bulk Redirect list item already correct"
+              list_item_already_correct="true"
+            else
+              echo "List item exists but differs (id=${existing_item_id}). Replacing it..."
+
+              delete_payload="$(jq -n --arg id "$existing_item_id" '[{id:$id}]')"
+              delete_resp="$(cf DELETE "/accounts/${CF_ACCOUNT_ID}/rules/lists/${list_id}/items" "$delete_payload")"
+              echo "$delete_resp" | jq -e '.success == true' >/dev/null || die "Delete list item failed: $(echo "$delete_resp" | jq -c '.errors')"
+              delete_op_id="$(echo "$delete_resp" | jq -r '.result.operation_id // empty')"
+              wait_for_list_bulk_operation "$delete_op_id" "delete list item"
+              ok "Bulk Redirect list item removed"
+            fi
+          fi
+
+          if [[ "$list_item_already_correct" != "true" ]]; then
           items_payload="$(jq -n \
-            --arg source "${PAGES_DEV_URL}/*" \
-            --arg target "${TARGET_URL}" \
+            --arg source "${desired_source}" \
+            --arg target "${desired_target}" \
             --argjson status_code "${STATUS_CODE}" \
             '[{
               redirect: {
@@ -269,25 +328,10 @@ jobs:
           op_id="$(echo "$items_resp" | jq -r '.result.operation_id // empty')"
           [[ -n "$op_id" ]] || die "No operation_id returned for list item update."
 
-          echo "Waiting for list operation to complete: ${op_id}"
-          for i in {1..30}; do
-            op="$(cf GET "/accounts/${CF_ACCOUNT_ID}/rules/lists/bulk_operations/${op_id}")"
-            echo "$op" | jq -e '.success == true' >/dev/null || die "Bulk op status failed: $(echo "$op" | jq -c '.errors')"
-            status="$(echo "$op" | jq -r '.result.status')"
-            echo "  status=${status}"
-            if [[ "$status" == "completed" ]]; then
-              break
-            fi
-            if [[ "$status" == "failed" ]]; then
-              die "Bulk operation failed: $(echo "$op" | jq -c '.result')"
-            fi
-            sleep 2
-          done
-
-          # Confirm completion
-          final_status="$(echo "$op" | jq -r '.result.status // empty')"
-          [[ "$final_status" == "completed" ]] || die "Bulk Redirect list item operation did not complete (status=${final_status})"
+          wait_for_list_bulk_operation "$op_id" "upsert list item"
           ok "Bulk Redirect list item applied"
+          fi
+
           end_group
 
           # -------------------------
@@ -299,15 +343,15 @@ jobs:
 
           entry="$(cf GET "/accounts/${CF_ACCOUNT_ID}/rulesets/phases/http_request_redirect/entrypoint")"
 
-          list_var="\$${LIST_NAME}"
-          expr="http.request.full_uri in ${list_var}"
+          list_variable_reference="\$${LIST_NAME}"
+          expr="http.request.full_uri in ${list_variable_reference}"
 
           new_rule="$(jq -n \
             --arg action "redirect" \
             --arg expression "${expr}" \
-            --arg description "Redirect ${PAGES_DEV_HOST} to ${CUSTOM_DOMAIN}" \
+            --arg description "${RULE_DESCRIPTION}" \
             --arg ref "${RULE_REF}" \
-            --arg list_name "${list_var}" \
+            --arg list_name "${LIST_NAME}" \
             '{
               action: $action,
               expression: $expression,
@@ -328,13 +372,35 @@ jobs:
             ruleset_desc="$(echo "$entry" | jq -r '.result.description // empty')"
             rules="$(echo "$entry" | jq -c '.result.rules // []')"
 
-            has_rule="$(echo "$rules" | jq -r --arg ref "${RULE_REF}" 'any(.[]; .ref == $ref)')"
+            existing_rule_index="$(echo "$rules" | jq -r --arg ref "${RULE_REF}" --arg desc "${RULE_DESCRIPTION}" '
+              (to_entries | map(select((.value.ref? == $ref) or (.value.description? == $desc))) | .[0].key) // empty
+            ' | head -n 1)"
 
-            if [[ "$has_rule" == "true" ]]; then
-              echo "Rule already present (ref=${RULE_REF})."
+            if [[ -n "${existing_rule_index:-}" ]]; then
+              echo "Rule already present (index=${existing_rule_index}). Verifying/updating link to list..."
+              existing_rule="$(echo "$rules" | jq -c --argjson index "$existing_rule_index" '.[ $index ]')"
+
+              existing_expression="$(echo "$existing_rule" | jq -r '.expression // empty')"
+              existing_list_name="$(echo "$existing_rule" | jq -r '.action_parameters.from_list.name // empty')"
+              existing_key="$(echo "$existing_rule" | jq -r '.action_parameters.from_list.key // empty')"
+
+              if [[ "$existing_expression" == "$expr" && "$existing_list_name" == "$LIST_NAME" && "$existing_key" == "http.request.full_uri" ]]; then
+                echo "Rule already points to the desired list. Skipping update."
+              else
+                echo "Updating existing rule to point to list ${LIST_NAME}..."
+                updated_rules="$(echo "$rules" | jq --argjson index "$existing_rule_index" --argjson rule_object "$new_rule" '.[$index] = $rule_object')"
+                upd_payload="$(jq -n \
+                  --arg name "${ruleset_name:-$RULESET_NAME}" \
+                  --arg description "${ruleset_desc:-$RULESET_NAME}" \
+                  --argjson rules "$updated_rules" \
+                  '{name:$name, description:$description, rules:$rules}'
+                )"
+                upd="$(cf PUT "/accounts/${CF_ACCOUNT_ID}/rulesets/phases/http_request_redirect/entrypoint" "$upd_payload")"
+                echo "$upd" | jq -e '.success == true' >/dev/null || die "Ruleset entrypoint update failed: $(echo "$upd" | jq -c '.errors')"
+              fi
             else
               echo "Appending rule (ref=${RULE_REF})..."
-              updated_rules="$(echo "$rules" | jq --argjson r "$new_rule" '. + [$r]')"
+              updated_rules="$(echo "$rules" | jq --argjson rule_object "$new_rule" '. + [$rule_object]')"
               upd_payload="$(jq -n \
                 --arg name "${ruleset_name:-$RULESET_NAME}" \
                 --arg description "${ruleset_desc:-$RULESET_NAME}" \
@@ -349,7 +415,7 @@ jobs:
             create_payload="$(jq -n \
               --arg name "${RULESET_NAME}" \
               --arg description "${RULESET_NAME}" \
-              --argjson rules "$(jq -n --argjson r "$new_rule" '[ $r ]')" \
+              --argjson rules "$(jq -n --argjson rule_object "$new_rule" '[ $rule_object ]')" \
               '{name:$name, description:$description, rules:$rules}'
             )"
             created="$(cf PUT "/accounts/${CF_ACCOUNT_ID}/rulesets/phases/http_request_redirect/entrypoint" "$create_payload")"
@@ -376,8 +442,8 @@ jobs:
           echo "Checking redirect: ${test_url_pagesdev} -> ${TARGET_URL}"
 
           redirect_ok="false"
-          for i in {1..15}; do
-            echo "Attempt ${i}/15..."
+          for attempt in {1..15}; do
+            echo "Attempt ${attempt}/15..."
             headers="$(curl -sS -o /dev/null -D - -I --max-time 15 "$test_url_pagesdev" || true)"
             status_line="$(echo "$headers" | head -n 1 | tr -d '\r')"
             location="$(echo "$headers" | awk 'BEGIN{IGNORECASE=1} /^Location:/{sub(/^Location:[[:space:]]*/,"",$0); gsub(/\r/,"",$0); print; exit}')"
@@ -414,11 +480,11 @@ jobs:
           # -------------------------
           echo ""
           echo "===== Final summary ====="
-          for s in "${SUMMARY_OK[@]}"; do
-            echo "✔ ${s}"
+          for summary_item in "${SUMMARY_OK[@]}"; do
+            echo "✔ ${summary_item}"
           done
-          for s in "${SUMMARY_WARN[@]}"; do
-            echo "! ${s}"
+          for summary_item in "${SUMMARY_WARN[@]}"; do
+            echo "! ${summary_item}"
           done
 
           echo "Done. Your pages.dev hostname should now redirect to the custom domain."
